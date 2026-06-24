@@ -24,27 +24,7 @@ Prerequisites
 - PostgreSQL 15+
 - Redis 7+
 - Qdrant 1.7+
-
-Development Setup
-
-# Clone repository
-git clone https://github.com/GSF-001/OASIS-information.git
-cd OASIS-information
-
-# Copy environment template
-cp .env.example .env
-
-# Start all services
-docker-compose up -d
-
-# Run migrations
-make migrate
-
-# Start development environment
-make dev
-
----
-
+  
 Monorepo Structure
 
 See "ARCHITECTURE.md" (./ARCHITECTURE.md) for complete system design.
