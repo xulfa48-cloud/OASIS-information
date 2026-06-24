@@ -1,1 +1,4 @@
-
+github.com/rs/zerolog v1.28.0 h1:SomeChecksumPlaceholderForExample
+github.com/lib/pq v1.10.7 h1:AnotherChecksumPlaceholder
+github.com/gorilla/mux v1.8.0 h1:ChecksumPlaceholder
+github.com/prometheus/client_golang v1.16.0 h1:ChecksumPlaceholder
