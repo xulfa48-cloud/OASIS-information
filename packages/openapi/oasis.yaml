@@ -1,0 +1,47 @@
+openapi: 3.0.0
+info:
+  title: OASIS API
+  version: 1.0.0
+paths:
+  /api/v1/papers:
+    post:
+      summary: Create paper
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaperCreate'
+      responses:
+        '201':
+          description: Created
+  /api/v1/kg/nodes:
+    post:
+      summary: Create KG node
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeCreate'
+      responses:
+        '201':
+          description: Created
+components:
+  schemas:
+    PaperCreate:
+      type: object
+      properties:
+        title:
+          type: string
+        authors:
+          type: array
+          items:
+            type: string
+    NodeCreate:
+      type: object
+      properties:
+        type:
+          type: string
+        properties:
+          type: object

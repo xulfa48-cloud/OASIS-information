@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paper-service
+  labels:
+    app: paper-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: paper-service
+  template:
+    metadata:
+      labels:
+        app: paper-service
+    spec:
+      containers:
+        - name: paper-service
+          image: ghcr.io/xulfa48-cloud/oasis/paper-service:latest
+          ports:
+            - containerPort: 8082
+          readinessProbe:
+            httpGet:
+              path: /api/v1/ready
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 20

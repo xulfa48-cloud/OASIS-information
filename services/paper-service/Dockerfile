@@ -1,14 +1,8 @@
-FROM node:18-alpine AS builder
-WORKDIR /build
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-
 FROM node:18-alpine
 WORKDIR /app
-COPY --from=builder /build/dist ./dist
-COPY --from=builder /build/node_modules ./node_modules
-COPY --from=builder /build/package*.json ./
-EXPOSE 3003
-CMD ["npm", "start"]
+COPY package*.json ./
+RUN npm ci --only=production
+COPY dist ./dist
+ENV NODE_ENV=production
+EXPOSE 8082
+CMD ["node", "dist/index.js"]
