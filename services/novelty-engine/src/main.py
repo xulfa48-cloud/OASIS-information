@@ -1,80 +1,123 @@
-from typing import List, Optional
+from fastapi import FastAPI
+from fastapi import HTTPException, status
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
 import os
-import asyncio
+import re
+import httpx
 import logging
-import math
-
-from fastapi import FastAPI, Depends, HTTPException, status
-from pydantic import BaseModel, conlist, constr
-
-import asyncpg
-import aioredis
+import time
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
 
-# Production-grade novelty engine service
+# Basic logging
+logger = logging.getLogger('novelty-engine')
+logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
 
-SERVICE_NAME = "novelty-engine"
-DB_DSN = os.getenv("NOVELTY_DATABASE_URL")
-REDIS_URL = os.getenv("NOVELTY_REDIS_URL")
-K = int(os.getenv("NOVELTY_DEFAULT_K", "10"))
+app = FastAPI(title="Novelty Engine", version="1.0.0")
 
-logger = logging.getLogger(SERVICE_NAME)
-logging.basicConfig(level=logging.INFO)
+# Environment / configuration
+KG_SERVICE_URL = os.getenv('KG_SERVICE_URL', 'http://knowledge-graph-service:8081')
+EMBEDDING_PROVIDER_URL = os.getenv('EMBEDDING_PROVIDER_URL')
+EMBEDDING_PROVIDER_KEY = os.getenv('EMBEDDING_PROVIDER_KEY')
+API_KEY = os.getenv('SERVICE_API_KEY')  # shared service-to-service API key
+REQUEST_TIMEOUT = float(os.getenv('NOVELTY_TIMEOUT', '15.0'))
+MAX_RETRIES = int(os.getenv('NOVELTY_MAX_RETRIES', '3'))
 
-app = FastAPI(title="OASIS Novelty Engine", version="1.0.0")
+# Observability
+REQUESTS = Counter('oasis_novelty_requests_total', 'Total novelty requests', ['status'])
+DURATION = Histogram('oasis_novelty_request_duration_seconds', 'Novelty request duration seconds')
 
-# Metrics
-REQUESTS = Counter('oasis_novelty_requests_total', 'Total requests', ['endpoint', 'method', 'status'])
-DURATION = Histogram('oasis_novelty_request_duration_seconds', 'Request duration', ['endpoint', 'method'])
+# Simple redaction patterns
+EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
 
-# DB and cache pools
-_db_pool: Optional[asyncpg.pool.Pool] = None
-_redis: Optional[aioredis.Redis] = None
+class NoveltyRequest(BaseModel):
+    text: str = Field(..., min_length=10, max_length=20000, description="Text to score for novelty")
+    top_k: Optional[int] = Field(10, ge=1, le=100, description="Number of nearest neighbors to consider")
+    context_ids: Optional[List[str]] = None
 
-class ScoreRequest(BaseModel):
-    document_id: Optional[constr(strip_whitespace=True, min_length=1)] = None
-    embedding: Optional[List[float]] = None
-    k: Optional[int] = K
-
-class ScoreResponse(BaseModel):
-    document_id: Optional[str]
+class NoveltyResponse(BaseModel):
     score: float
-    neighbors: List[dict]
+    details: Dict[str, Any]
 
-async def get_db_pool():
-    global _db_pool
-    if _db_pool is None:
-        if not DB_DSN:
-            raise RuntimeError("NOVELTY_DATABASE_URL not configured")
-        _db_pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=10)
-    return _db_pool
 
-async def get_redis():
-    global _redis
-    if _redis is None:
-        if not REDIS_URL:
-            raise RuntimeError("NOVELTY_REDIS_URL not configured")
-        _redis = await aioredis.from_url(REDIS_URL)
-    return _redis
+def redact(text: str) -> str:
+    t = EMAIL_RE.sub('[REDACTED_EMAIL]', text)
+    t = PHONE_RE.sub('[REDACTED_PHONE]', t)
+    return t
 
-@app.on_event("startup")
-async def startup_event():
-    await get_db_pool()
-    await get_redis()
-    logger.info("novelty-engine started")
+async def fetch_embedding(text: str) -> List[float]:
+    """Call external embedding provider. Expects JSON {"input": "..."} -> {"embedding": [...]}"""
+    if not EMBEDDING_PROVIDER_URL or not EMBEDDING_PROVIDER_KEY:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail='embedding provider not configured')
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    global _db_pool, _redis
-    if _db_pool:
-        await _db_pool.close()
-    if _redis:
-        await _redis.close()
-    logger.info("novelty-engine stopped")
+    headers = {"Authorization": f"Bearer {EMBEDDING_PROVIDER_KEY}", "Content-Type": "application/json"}
+    payload = {"input": text}
+    backoff = 0.5
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                r = await client.post(EMBEDDING_PROVIDER_URL, json=payload, headers=headers)
+                if r.status_code == 200:
+                    data = r.json()
+                    emb = data.get('embedding')
+                    if not isinstance(emb, list):
+                        raise HTTPException(status_code=502, detail='invalid embedding response')
+                    return emb
+                if r.status_code in (429, 502, 503, 504):
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                raise HTTPException(status_code=502, detail='embedding provider error')
+        except httpx.RequestError as e:
+            logger.warning('embedding_request_error', error=str(e), attempt=attempt)
+            await asyncio.sleep(backoff)
+            backoff *= 2
+    raise HTTPException(status_code=502, detail='embedding provider unavailable')
 
-@app.get('/metrics')
-async def metrics():
-    return generate_latest()
+
+async def kg_vector_search(embedding: List[float], k: int) -> List[Dict[str, Any]]:
+    """Query KG service for nearest neighbors using vector search API.
+    Expects KG to expose POST /api/v1/kg/search with {"query_embedding": [...], "k": int}
+    Returns list of nodes with distance.
+    """
+    url = f"{KG_SERVICE_URL}/api/v1/kg/search"
+    payload = {"query_embedding": embedding, "k": k}
+    headers = {"Content-Type": "application/json"}
+    backoff = 0.5
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                if r.status_code == 200:
+                    return r.json().get('results', [])
+                if r.status_code in (429, 502, 503, 504):
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                logger.error('kg_search_error', status=r.status_code, body=r.text)
+                raise HTTPException(status_code=502, detail='kg search failed')
+        except httpx.RequestError as e:
+            logger.warning('kg_search_request_error', error=str(e), attempt=attempt)
+            await asyncio.sleep(backoff)
+            backoff *= 2
+    raise HTTPException(status_code=502, detail='kg service unavailable')
+
+
+def compute_novelty_score(distances: List[float], max_distance: float = 2.0) -> float:
+    """Compute a novelty score in [0,1] where 1 is highly novel.
+    Use distance-based scoring: if nearest neighbors are far, novelty increases.
+    """
+    if not distances:
+        return 1.0
+    # Normalize distances to [0,1] using a soft threshold
+    norm = [min(d / max_distance, 1.0) for d in distances]
+    # Higher normalized distance -> more novel -> compute mean
+    score = sum(norm) / len(norm)
+    # Bound and invert so that large distance -> score closer to 1
+    return round(score, 4)
+
 
 @app.get('/api/v1/health')
 async def health():
@@ -82,60 +125,43 @@ async def health():
 
 @app.get('/api/v1/ready')
 async def ready():
-    try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute('SELECT 1')
-        r = await get_redis()
-        await r.ping()
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    # readiness: embedding provider presence
+    if not EMBEDDING_PROVIDER_URL or not EMBEDDING_PROVIDER_KEY:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail='embedding provider not configured')
     return {"status": "ready"}
 
-@app.post('/api/v1/novelty/score', response_model=ScoreResponse)
-async def score(req: ScoreRequest):
-    start = asyncio.get_event_loop().time()
-    endpoint = '/api/v1/novelty/score'
+@app.get('/metrics')
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.post('/api/v1/novelty/score', response_model=NoveltyResponse)
+async def score(req: NoveltyRequest, x_api_key: Optional[str] = None):
+    start = time.time()
     try:
-        if req.embedding is None and req.document_id is None:
-            raise HTTPException(status_code=400, detail="document_id or embedding must be provided")
+        # Lightweight service-to-service API key
+        if API_KEY and x_api_key != API_KEY:
+            raise HTTPException(status_code=401, detail='invalid api key')
 
-        pool = await get_db_pool()
-        # If document_id provided, load its embedding
-        embedding = req.embedding
-        if req.document_id is not None and embedding is None:
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow('SELECT embedding FROM nodes WHERE id = $1', req.document_id)
-                if not row:
-                    raise HTTPException(status_code=404, detail="document not found")
-                embedding = row['embedding']
-
-        if embedding is None:
-            raise HTTPException(status_code=400, detail="embedding not available")
-
-        k = min(req.k or K, 100)
-        # Use pgvector operator <-> for distance. Ensure pgvector extension and nodes.embedding exists.
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(f"SELECT id, properties, embedding <-> $1 AS distance FROM nodes ORDER BY distance ASC LIMIT {k}", embedding)
-            neighbors = []
-            for r in rows:
-                neighbors.append({
-                    'id': str(r['id']),
-                    'properties': r['properties'],
-                    'distance': float(r['distance'])
-                })
-
-        # Simple novelty heuristic: average distance to k nearest neighbors
-        if len(neighbors) == 0:
-            novelty = 1.0
-        else:
-            avg = sum(n['distance'] for n in neighbors) / len(neighbors)
-            # Normalize using sigmoid for bounded score [0,1]
-            novelty = 1.0 - (1.0 / (1.0 + math.exp(- (avg - 0.5))))
-
-        return ScoreResponse(document_id=req.document_id, score=novelty, neighbors=neighbors)
-    finally:
-        elapsed = asyncio.get_event_loop().time() - start
-        REQUESTS.labels(endpoint=endpoint, method='POST', status='200').inc()
-        DURATION.labels(endpoint=endpoint, method='POST').observe(elapsed)
-
+        text = redact(req.text)
+        # Get embedding for the input text
+        emb = await fetch_embedding(text)
+        # Query KG for nearest neighbors
+        neighbors = await kg_vector_search(emb, req.top_k)
+        distances = [n.get('distance', 0.0) for n in neighbors]
+        score_value = compute_novelty_score(distances)
+        details = {
+            'neighbor_count': len(neighbors),
+            'sample_neighbors': [
+                {'id': n.get('id'), 'distance': n.get('distance')} for n in neighbors[:5]
+            ]
+        }
+        REQUESTS.labels(status='ok').inc()
+        DURATION.observe(time.time() - start)
+        return NoveltyResponse(score=score_value, details=details)
+    except HTTPException:
+        REQUESTS.labels(status='error').inc()
+        raise
+    except Exception as e:
+        logger.exception('novelty_error')
+        REQUESTS.labels(status='error').inc()
+        raise HTTPException(status_code=500, detail='internal server error')

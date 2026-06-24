@@ -27,7 +27,6 @@ COPILOT_REQUEST_TIMEOUT = float(os.getenv('COPILOT_REQUEST_TIMEOUT', '30.0'))
 COPILOT_MAX_RETRIES = int(os.getenv('COPILOT_MAX_RETRIES', '3'))
 JWT_PUBLIC_KEY = os.getenv('AUTH_JWT_PUBLIC')  # RSA public key in PEM format
 JWT_ALGORITHM = os.getenv('AUTH_JWT_ALGORITHM', 'RS256')
-RATE_LIMIT_REDIS = os.getenv('RATE_LIMIT_REDIS_URL')
 RATE_LIMIT_PER_MINUTE = int(os.getenv('RATE_LIMIT_PER_MINUTE', '60'))
 
 # Observability
