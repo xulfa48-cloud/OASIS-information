@@ -1,10 +1,10 @@
-# Contributing to ResearchOS
+## Contributing to OASIS🏜️
 
-## Code of Conduct
+#### Code of Conduct
 
 Be respectful, inclusive, and professional.
 
-## Development Setup
+#### Development Setup
 
 1. **Clone & Navigate**
 ```bash
@@ -14,7 +14,7 @@ cd researchos
 ```
 2.Environment
 cp .env.example .env
-# Edit .env with your settings
+#### Edit .env with your settings
 
 3.Local Services
 docker-compose up -d
@@ -140,24 +140,3 @@ SENTRY_DSN=...
 # ==== ENVIRONMENT ====
 ENVIRONMENT=development
 # Options: development, staging, production
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
